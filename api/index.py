@@ -699,65 +699,61 @@ def index():
 def generate_qr():
     data = request.form.get('data')
     file = request.files.get('file')
-    filename = request.form.get('filename') or 'qr_code'
+    filename = secure_filename(request.form.get('filename') or 'qr_code')
     color = request.form.get('color', '#000000')
-    bw = request.form.get('bw')
-    contrast_qr = request.form.get('contrast_qr')  # Checkbox for high contrast QR color
-    check_scannable = request.form.get('check_scannable', 'false') == 'true'  # New parameter
 
     if not data:
         return "No data provided", 400
 
-    filename = secure_filename(filename)
-    file_extension = 'png'
-    qr = segno.make(data, error='H', boost_error=True)
-    temp_file_path = None
+    filename = f"{filename}.png"
+    img_io = BytesIO()
 
     if file:
-        # ✅ Save file to /tmp (allowed by Vercel)
         file_ext = os.path.splitext(file.filename)[1].lower()
         allowed_extensions = {'.png', '.jpg', '.jpeg', '.gif'}
         if file_ext not in allowed_extensions:
             return "Invalid file format. Please upload a PNG, JPG, or GIF image.", 400
-
+        
+        # ✅ Save file to /tmp
         temp_file = tempfile.NamedTemporaryFile(delete=False, dir=UPLOAD_FOLDER, suffix=file_ext)
         file.save(temp_file.name)
         temp_file_path = temp_file.name
 
-        output_qr_path = tempfile.NamedTemporaryFile(delete=False, suffix=file_ext).name
-
         try:
-            # ✅ Generate QR with background
-            qr.to_artistic(background=temp_file_path, target=output_qr_path, scale=12, dark=color)
+            # ✅ Generate QR code with background using to_artistic()
+            qr = segno.make(data, error='h')
+            output_qr_path = tempfile.NamedTemporaryFile(delete=False, suffix='.png').name
+            
+            qr.to_artistic(
+                background=temp_file_path, 
+                target=output_qr_path, 
+                scale=12, 
+                dark=color
+            )
 
-            if check_scannable:
-                is_scannable = is_qr_code_scannable(output_qr_path)
-
+            # ✅ Read the QR code and serve it
             with open(output_qr_path, "rb") as qr_file:
                 img_io.write(qr_file.read())
             img_io.seek(0)
 
         except Exception as e:
             return f"Error generating QR code: {e}", 400
+
         finally:
-            os.unlink(temp_file_path)  # ✅ Clean up temporary file
-            os.unlink(output_qr_path)
+            # ✅ Clean up temp files
+            if temp_file_path:
+                os.unlink(temp_file_path)
+            if os.path.exists(output_qr_path):
+                os.unlink(output_qr_path)
 
     else:
-        # ✅ Generate QR without background
+        # ✅ Generate QR code without background
+        qr = segno.make(data, error='h')
         qr.save(img_io, kind='png', scale=12, dark=color)
         img_io.seek(0)
-        is_scannable = True
 
-    # ✅ Return JSON response if not scannable
-    if check_scannable and not is_scannable:
-        return jsonify({
-            'scannable': False,
-            'filename': f"{filename}.png",
-            'message': "The generated QR code may not be scannable. Please try a different background or color."
-        })
+    return send_file(img_io, mimetype='image/png', as_attachment=True, download_name=filename)
 
-    return send_file(img_io, mimetype='image/png', as_attachment=True, download_name=f"{filename}.png")
 
 def is_qr_code_scannable(image_path):
     try:
