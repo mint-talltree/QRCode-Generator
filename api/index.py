@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image, ImageStat, ImageOps, ImageSequence
 
 import cv2
-from pyzbar.pyzbar import decode
+#from pyzbar.pyzbar import decode
 
 app = Flask(__name__)
 UPLOAD_FOLDER = '/tmp/uploads'
@@ -615,11 +615,11 @@ HTML_TEMPLATE = '''
 '''
 
 def is_qr_code_scannable(image_path):
-    """Check if the generated QR code is scannable."""
     try:
         image = cv2.imread(image_path)
-        qr_codes = decode(image)
-        return len(qr_codes) > 0
+        qr_code_detector = cv2.QRCodeDetector()
+        data, _, _ = qr_code_detector.detectAndDecode(image)
+        return bool(data)  # If data is extracted, it's scannable
     except Exception as e:
         print(f"Error checking QR code scannability: {e}")
         return False
