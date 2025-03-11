@@ -1,2 +1,8 @@
-Flask==3.0.0
-replicate==0.14.0
+Flask==3.0.3
+segno==1.6.1
+Pillow==10.2.0
+Werkzeug==3.0.2
+requests==2.31.0
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
+pyzbar==0.1.9
