@@ -17,7 +17,6 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 HTML_TEMPLATE = '''
-<!doctype html>
 <html lang="en">
 <head>
     <title>QR Code Generator</title>
@@ -80,6 +79,7 @@ HTML_TEMPLATE = '''
 
         .form-group {
             margin-bottom: 1.5rem;
+            width: 100%;
         }
 
         label {
@@ -99,6 +99,7 @@ HTML_TEMPLATE = '''
             background-color: white;
             font-size: 1rem;
             transition: all 0.2s ease;
+            box-sizing: border-box;
         }
 
         input[type="text"]:focus,
@@ -117,6 +118,8 @@ HTML_TEMPLATE = '''
             transition: all 0.2s ease;
             margin-bottom: 1.5rem;
             background-color: rgba(67, 97, 238, 0.03);
+            width: 100%;
+            box-sizing: border-box;
         }
 
         .file-upload:hover {
@@ -145,6 +148,7 @@ HTML_TEMPLATE = '''
             flex-direction: column;
             gap: 0.5rem;
             margin-bottom: 1.5rem;
+            width: 100%;
         }
 
         .color-row {
@@ -208,12 +212,39 @@ HTML_TEMPLATE = '''
             cursor: pointer;
             padding: 1rem;
             transition: all 0.2s ease;
+            position: relative;
+            display: flex;
+            justify-content: center;
+            align-items: center;
         }
 
         button:hover {
             background-color: var(--secondary);
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(67, 97, 238, 0.2);
+        }
+
+        button:disabled {
+            background-color: #a3a3a3;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .spinner {
+            display: none;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s linear infinite;
+            margin-right: 10px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
 
         .coffee-section {
@@ -382,7 +413,10 @@ HTML_TEMPLATE = '''
                     <input type="text" id="filename-input" name="filename" placeholder="Enter filename for your QR code">
                 </div>
 
-                <button type="submit">Generate QR Code</button>
+                <button type="submit" id="generate-button">
+                    <div class="spinner" id="loading-spinner"></div>
+                    <span id="button-text">Generate QR Code</span>
+                </button>
             </form>
         </div>
 
@@ -430,6 +464,9 @@ HTML_TEMPLATE = '''
             const unscannableModal = document.getElementById('unscannable-modal');
             const tryAgainBtn = document.getElementById('try-again-btn');
             const downloadAnywayBtn = document.getElementById('download-anyway-btn');
+            const generateButton = document.getElementById('generate-button');
+            const loadingSpinner = document.getElementById('loading-spinner');
+            const buttonText = document.getElementById('button-text');
             
             // Flag to track if we're downloading anyway
             let downloadAnyway = false;
@@ -447,6 +484,18 @@ HTML_TEMPLATE = '''
 
                 // Consider color light if luminance is above 0.5
                 return luminance > 0.5;
+            }
+
+            function showLoading() {
+                loadingSpinner.style.display = 'block';
+                buttonText.textContent = 'Generating...';
+                generateButton.disabled = true;
+            }
+
+            function hideLoading() {
+                loadingSpinner.style.display = 'none';
+                buttonText.textContent = 'Generate QR Code';
+                generateButton.disabled = false;
             }
 
             colorPicker.addEventListener('input', function() {
@@ -472,6 +521,7 @@ HTML_TEMPLATE = '''
                 // If not downloading anyway, intercept the form submission
                 if (!downloadAnyway) {
                     event.preventDefault();
+                    showLoading();
                     
                     const formData = new FormData(qrForm);
                     
@@ -487,6 +537,7 @@ HTML_TEMPLATE = '''
                             return response.json().then(data => {
                                 if (data.scannable === false) {
                                     // Show the modal if not scannable
+                                    hideLoading();
                                     unscannableModal.style.display = 'block';
                                     // Save the blob data for potential download
                                     return response.blob().then(blob => {
@@ -497,6 +548,7 @@ HTML_TEMPLATE = '''
                                 } else {
                                     // If scannable, get the blob and trigger download
                                     return response.blob().then(blob => {
+                                        hideLoading();
                                         downloadQrCode(blob, data.filename);
                                         return data;
                                     });
@@ -505,6 +557,7 @@ HTML_TEMPLATE = '''
                         } else {
                             // If response is not JSON, it's the direct file
                             return response.blob().then(blob => {
+                                hideLoading();
                                 downloadQrCode(blob, formData.get('filename') || 'qr_code');
                                 return { scannable: true };
                             });
@@ -512,8 +565,12 @@ HTML_TEMPLATE = '''
                     })
                     .catch(error => {
                         console.error('Error:', error);
+                        hideLoading();
                         alert('An error occurred. Please try again.');
                     });
+                } else {
+                    // Show loading when submitting form directly
+                    showLoading();
                 }
                 
                 // Reset the flag after submission
@@ -546,6 +603,7 @@ HTML_TEMPLATE = '''
                 } else {
                     // If we don't have the blob yet, resubmit the form with the flag
                     downloadAnyway = true;
+                    showLoading();
                     qrForm.submit();
                 }
             });
