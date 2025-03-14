@@ -1,543 +1,776 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, send_file
+from flask import Flask, request, send_file, render_template_string
+import segno
 import os
-import pandas as pd
-import tempfile
+import shutil
 from werkzeug.utils import secure_filename
-from pathlib import Path
-import cv2
+from io import BytesIO
+import tempfile
 import numpy as np
-import re
-import io
-import unicodedata
-from google.cloud import vision
+from PIL import Image, ImageStat, ImageOps, ImageSequence
+
+import cv2
+#from pyzbar.pyzbar import decode
 
 app = Flask(__name__)
-app.secret_key = "business_card_scanner_secret_key"
-
-# Configure upload folder
-UPLOAD_FOLDER = tempfile.mkdtemp()
-RESULTS_FOLDER = tempfile.mkdtemp()
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-
-# Create upload and results directories if they don't exist
+UPLOAD_FOLDER = '/tmp/uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(RESULTS_FOLDER, exist_ok=True)
-
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['RESULTS_FOLDER'] = RESULTS_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB max upload
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def detect_text_with_google_vision(image_path):
-    """Detect text in an image using Google Cloud Vision API."""
-    client = vision.ImageAnnotatorClient()
-
-    # Read the image file
-    with io.open(image_path, 'rb') as image_file:
-        content = image_file.read()
-
-    image = vision.Image(content=content)
-    response = client.text_detection(image=image)
-
-    if response.error.message:
-        raise Exception(
-            '{}\nFor more info on error messages, check: '
-            'https://cloud.google.com/apis/design/errors'.format(
-                response.error.message))
-
-    # Get full text and also the individual text annotations with bounding boxes
-    full_text = response.text_annotations[0].description if response.text_annotations else ""
-
-    # Extract individual text blocks with their positions for spatial analysis
-    text_blocks = []
-    if len(response.text_annotations) > 1:  # Skip first one as it's the full text
-        for text_annotation in response.text_annotations[1:]:
-            vertices = [(vertex.x, vertex.y) for vertex in text_annotation.bounding_poly.vertices]
-            # Calculate centroid of bounding box
-            x_coords = [vertex[0] for vertex in vertices]
-            y_coords = [vertex[1] for vertex in vertices]
-            centroid_x = sum(x_coords) / len(x_coords)
-            centroid_y = sum(y_coords) / len(y_coords)
-
-            text_blocks.append({
-                'text': text_annotation.description,
-                'vertices': vertices,
-                'centroid': (centroid_x, centroid_y)
-            })
-
-    return full_text, text_blocks
-
-def normalize_text(text):
-    """Normalize text by removing extra spaces and converting to full-width to half-width."""
-    # Convert full-width characters to half-width
-    text = unicodedata.normalize('NFKC', text)
-    # Remove extra spaces
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
-def extract_email(text):
-    """Extract email addresses from text."""
-    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    emails = re.findall(email_pattern, text)
-    return emails[0] if emails else ''
-
-def extract_phone_fax(text):
-    """Extract phone and fax numbers from text."""
-    # Enhanced phone pattern matching for international and Japanese formats
-    phone_patterns = [
-        r'\+\d{1,3}[-.\s]?\d{2,4}[-.\s]?\d{2,4}[-.\s]?\d{4}',  # International format
-        r'(?:\(?\d{2,4}\)?[-.\s]?){2,3}\d{4}',                 # Standard format
-        r'\d{2,4}[-.\s]?\d{2,4}[-.\s]?\d{4}',                  # Japanese format
-        r'0120[-.\s]?\d{2,3}[-.\s]?\d{3,4}'                    # Japanese toll-free
-    ]
-
-    phone = ''
-    fax = ''
-
-    # Process each line to distinguish between phone and fax
-    for line in text.split('\n'):
-        line_lower = line.lower()
-
-        # Check if the line is explicitly labeled as fax
-        is_fax_line = any(fax_label in line_lower for fax_label in ['fax', 'ファックス', 'f:', 'f.'])
-
-        # Apply each pattern to find numbers
-        for pattern in phone_patterns:
-            numbers = re.findall(pattern, line)
-            for num in numbers:
-                # Clean up the found number
-                clean_num = re.sub(r'[\s.]+', '-', num)
-
-                # Store as either phone or fax
-                if is_fax_line and not fax:
-                    fax = clean_num
-                elif not is_fax_line and not phone:
-                    phone = clean_num
-
-    return phone, fax
-
-def extract_website(text):
-    """Extract website URLs from text."""
-    # Enhanced website pattern matching
-    website_patterns = [
-        r'(?:https?:\/\/)?(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]+[a-zA-Z0-9]\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?(?:\/\S*)?',
-        r'(?:[a-zA-Z0-9][a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:\/\S*)?'
-    ]
-
-    for line in text.split('\n'):
-        line = line.lower().strip()
-        # Skip lines that are likely not websites (e.g., email addresses)
-        if '@' in line:
-            continue
-
-        for pattern in website_patterns:
-            websites = re.findall(pattern, line)
-            if websites:
-                website = websites[0]
-                # Remove trailing punctuation
-                website = re.sub(r'[.,;:]$', '', website)
-                # Add https:// if missing
-                if not website.startswith(('http://', 'https://')):
-                    website = 'https://' + website
-                return website.strip('/')
-    return ''
-
-def extract_position(text):
-    """Extract job position/title from text."""
-    # Common job titles in English and Japanese
-    position_patterns = [
-        r'(?i)(CEO|CTO|CFO|COO|President|Director|Manager|Executive|Officer|Supervisor|Leader|Head\s+of.*?|.*?Engineer|.*?Developer|Consultant|Specialist|Associate|Analyst|Coordinator)',
-        r'(代表取締役|取締役|部長|課長|主任|係長|担当|エンジニア|マネージャー|コンサルタント|スペシャリスト)'
-    ]
-
-    for line in text.split('\n'):
-        line = line.strip()
-        for pattern in position_patterns:
-            match = re.search(pattern, line)
-            if match:
-                # Check if the position is part of a longer title or just a word in a sentence
-                # Return the full line if it seems like a concise title
-                if len(line) < 40 and not re.search(r'@|www|https?:|\.com', line):
-                    # Check if line appears to be a full address
-                    if not re.search(r'\d+[-\d]*', line) or not any(x in line for x in ['市', '区', '県', 'Street', 'Ave']):
-                        return line
-                # Otherwise just return the matched position
-                return match.group(0)
-    return ''
-
-def extract_company_names(text, text_blocks):
-    """Extract company names in Japanese and English."""
-    company_jp = ''
-    company_en = ''
-
-    # Japanese company indicators
-    jp_company_indicators = ['株式会社', '有限会社', '合同会社', '株式会社', '社団法人', '財団法人', '企業']
-
-    # English company indicators
-    en_company_indicators = ['Co.', 'Ltd.', 'Inc.', 'Corp.', 'Corporation', 'Company', 'Limited', 'LLC', 'LLP', 'Group']
-
-    # First check in the full text by lines
-    for line in text.split('\n'):
-        line = line.strip()
-
-        # Japanese company detection
-        if not company_jp:
-            for indicator in jp_company_indicators:
-                if indicator in line:
-                    # Extract the company name including the indicator
-                    company_jp = line
-                    break
-
-        # English company detection
-        if not company_en:
-            for indicator in en_company_indicators:
-                # Match the indicator as a whole word
-                if re.search(r'\b' + re.escape(indicator) + r'\b', line):
-                    company_en = line
-                    break
-
-    # If company names weren't found by line analysis, try spatial analysis with text blocks
-    if text_blocks and (not company_jp or not company_en):
-        # Sort text blocks by y-coordinate (top to bottom)
-        sorted_blocks = sorted(text_blocks, key=lambda x: x['centroid'][1])
-
-        # Look for company indicators in the blocks
-        for block in sorted_blocks:
-            block_text = block['text']
-
-            # Japanese company
-            if not company_jp:
-                for indicator in jp_company_indicators:
-                    if indicator in block_text:
-                        company_jp = block_text
-                        break
-
-            # English company
-            if not company_en:
-                for indicator in en_company_indicators:
-                    if re.search(r'\b' + re.escape(indicator) + r'\b', block_text):
-                        company_en = block_text
-                        break
-
-            # Exit if both found
-            if company_jp and company_en:
-                break
-
-    # Clean up company names
-    if company_jp:
-        company_jp = clean_company_name(company_jp)
-    if company_en:
-        company_en = clean_company_name(company_en)
-
-    return company_jp, company_en
-
-def clean_company_name(company):
-    """Clean and standardize company names."""
-    # Remove common noise patterns
-    noise_patterns = [
-        r'\s*[\(\（].*?[\)\）]',  # Text in parentheses
-        r'\s*[,\.]$',            # Trailing punctuation
-        r'^\s*[,\.]',            # Leading punctuation
-    ]
-
-    cleaned = company
-    for pattern in noise_patterns:
-        cleaned = re.sub(pattern, '', cleaned)
-
-    return cleaned.strip()
-
-def is_japanese_text(text):
-    """Check if text contains Japanese characters."""
-    return any('\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u309f' or '\u30a0' <= c <= '\u30ff' for c in text)
-
-def extract_names(text, text_blocks):
-    """Extract Japanese and English names with improved accuracy."""
-    japanese_name = ''
-    english_name = ''
-
-    # First look at the top blocks which usually contain names
-    if text_blocks:
-        # Sort blocks by Y position (top to bottom)
-        sorted_blocks = sorted(text_blocks, key=lambda x: x['centroid'][1])
-        top_blocks = sorted_blocks[:5]  # Look at top 5 blocks
-
-        for block in top_blocks:
-            block_text = block['text'].strip()
-
-            # Skip if it's likely an address, email, website, or phone
-            if re.search(r'@|www|https?:|\.com|\d{3,}', block_text):
-                continue
-
-            # Japanese name detection
-            if not japanese_name and is_japanese_text(block_text):
-                if 1 < len(block_text) <= 10:  # Adjusted length for full names
-                    japanese_name = block_text
-
-            # English name detection
-            if not english_name and re.match(r'^[A-Za-z\s.]+$', block_text):
-                if 2 < len(block_text) < 40 and len(block_text.split()) <= 4:  # Reasonable name length
-                    english_name = block_text
-
-    # If names weren't found in blocks, try line-by-line analysis
-    if not japanese_name or not english_name:
-        lines = [line.strip() for line in text.split('\n') if line.strip()]
-        for i, line in enumerate(lines):
-            if i > 4:  # Only check first few lines
-                break
-
-            # Skip if it's likely an address, email, website, or phone
-            if re.search(r'@|www|https?:|\.com|\d{3,}', line):
-                continue
-
-            # Japanese name
-            if not japanese_name and is_japanese_text(line):
-                if 1 < len(line) <= 10:
-                    japanese_name = line
-
-            # English name
-            if not english_name and re.match(r'^[A-Za-z\s.]+$', line):
-                if 2 < len(line) < 40 and len(line.split()) <= 4:
-                    english_name = line
-
-    return japanese_name, english_name
-
-def extract_address(text):
-    """Extract postal address from text."""
-    address = ''
-
-    # Japanese address patterns (postal code + address)
-    jp_address_patterns = [
-        r'〒\d{3}-\d{4}\s*[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]+',  # Postal code + Japanese text
-        r'\d{3}-\d{4}\s*[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]+',    # Postal code without symbol + Japanese text
-        r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]*[都道府県市区町村][\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\d-]+' # Address with prefecture/city indicators
-    ]
-
-    # English/international address patterns
-    en_address_patterns = [
-        r'\d+\s+[A-Za-z\s,]+(?:Street|St\.|Road|Rd\.|Avenue|Ave\.|Boulevard|Blvd\.|Lane|Ln\.|Drive|Dr\.|Building|Bldg\.)',
-        r'[A-Za-z]+\s+\d+,\s+[A-Za-z\s,]+\d{4,}',  # Format like "Some Street 123, City 12345"
-        r'\d+\s+[A-Za-z\s,]+,\s+[A-Za-z\s]+,\s+[A-Z]{2}\s+\d{5}'  # US format with state code
-    ]
-
-    # Process each line to find addresses
-    for line in text.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-
-        # Skip lines that are clearly not addresses
-        if re.search(r'@|www|https?:|\.com', line):
-            continue
-
-        # Check Japanese patterns
-        for pattern in jp_address_patterns:
-            if re.search(pattern, line):
-                # If the line contains an address pattern and has location indicators, it's likely an address
-                if any(marker in line for marker in ['丁目', '番地', '号', '階', '市', '区', '町', '村', '県']):
-                    return line
-
-        # Check English patterns
-        for pattern in en_address_patterns:
-            if re.search(pattern, line, re.I):
-                return line
-
-        # Fallback for lines that look like addresses but don't match patterns
-        if len(line) > 10 and re.search(r'\d+', line):
-            words = line.split()
-            # If line has numbers and multiple words, it might be an address
-            if len(words) > 3 and any(re.match(r'\d+', word) for word in words):
-                # Check for common address words
-                address_indicators = ['floor', 'suite', 'apt', 'apartment', 'room', 'building', 'block', 'street']
-                if any(indicator in line.lower() for indicator in address_indicators):
-                    return line
-
-    return address
-
-def extract_postal_code(text):
-    """Extract postal code from text."""
-    # Japanese postal code patterns
-    jp_patterns = [
-        r'〒\s*(\d{3}-\d{4})',
-        r'郵便番号\s*(\d{3}-\d{4})',
-        r'(\d{3}-\d{4})'  # Basic pattern, might need context checking
-    ]
-
-    # International postal code patterns
-    intl_patterns = [
-        r'[Pp]ostal\s+[Cc]ode:?\s*([A-Z0-9\s-]{3,10})',
-        r'[Zz][Ii][Pp]\s*[Cc]ode:?\s*(\d{5}(?:-\d{4})?)'
-    ]
-
-    for line in text.split('\n'):
-        # Check Japanese patterns first
-        for pattern in jp_patterns:
-            match = re.search(pattern, line)
-            if match:
-                return match.group(1)
-
-        # Then check international patterns
-        for pattern in intl_patterns:
-            match = re.search(pattern, line)
-            if match:
-                return match.group(1)
-
-    return ''
-
-def extract_info_from_image(image_path):
-    """Extract all information from a business card image."""
-    # Get text from Google Cloud Vision
-    full_text, text_blocks = detect_text_with_google_vision(image_path)
-
-    # Normalize the text
-    normalized_text = normalize_text(full_text)
-
-    # Extract phone and fax
-    phone, fax = extract_phone_fax(full_text)
-
-    # Extract company names
-    company_jp, company_en = extract_company_names(full_text, text_blocks)
-
-    # Extract personal names
-    japanese_name, english_name = extract_names(full_text, text_blocks)
-
-    # Gather all information
-    info = {
-        'japanese_name': japanese_name,
-        'english_name': english_name,
-        'email': extract_email(full_text),
-        'phone': phone,
-        'fax': fax,
-        'website': extract_website(full_text),
-        'company_jp': company_jp,
-        'company_en': company_en,
-        'position': extract_position(full_text),
-        'address': extract_address(full_text),
-        'postal_code': extract_postal_code(full_text),
-        'raw_text': full_text.strip(),
-        'filename': Path(image_path).name
-    }
-
-    return info
-
-def process_multiple_cards(file_paths):
-    """Process multiple business card images and return results."""
-    data = []
-    
-    for file_path in file_paths:
-        try:
-            info = extract_info_from_image(file_path)
-            if info:
-                data.append(info)
-        except Exception as e:
-            flash(f"Error processing {Path(file_path).name}: {str(e)}", "error")
-    
-    return data
+
+HTML_TEMPLATE = '''
+<!doctype html>
+<html lang="en">
+<head>
+    <title>QR Code Generator</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        :root {
+            --primary: #4361ee;
+            --secondary: #3f37c9;
+            --accent: #4895ef;
+            --background: #f8f9fa;
+            --card-bg: #ffffff;
+            --text: #212529;
+            --border: #dee2e6;
+            --success: #38b000;
+            --warning: #ff5400;
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background-color: var(--background);
+            color: var(--text);
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 600px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+            padding: 2rem;
+            margin-bottom: 2rem;
+            transition: transform 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+        }
+
+        h1 {
+            color: var(--primary);
+            text-align: center;
+            margin-top: 0;
+            margin-bottom: 1.5rem;
+            font-weight: 700;
+            font-size: 2rem;
+        }
+
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            color: var(--text);
+        }
+
+        input[type="text"],
+        input[type="file"],
+        button {
+            width: 100%;
+            padding: 0.8rem 1rem;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background-color: white;
+            font-size: 1rem;
+            transition: all 0.2s ease;
+        }
+
+        input[type="text"]:focus,
+        input[type="file"]:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.15);
+        }
+
+        .file-upload {
+            border: 2px dashed var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin-bottom: 1.5rem;
+            background-color: rgba(67, 97, 238, 0.03);
+        }
+
+        .file-upload:hover {
+            border-color: var(--accent);
+            background-color: rgba(67, 97, 238, 0.06);
+        }
+
+        .file-upload p {
+            margin: 0 0 0.5rem 0;
+            font-weight: 500;
+        }
+
+        .file-upload input[type="file"] {
+            display: none;
+        }
+
+        .file-name {
+            font-size: 0.875rem;
+            color: var(--accent);
+            margin-top: 0.5rem;
+            display: none;
+        }
+
+        .color-section {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .color-row {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .color-picker-container {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex-grow: 1;
+        }
+
+        .color-preview {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            display: inline-block;
+        }
+
+        input[type="color"] {
+            -webkit-appearance: none;
+            width: 40px;
+            height: 40px;
+            border: none;
+            border-radius: 8px;
+            background: none;
+            cursor: pointer;
+        }
+
+        input[type="color"]::-webkit-color-swatch-wrapper {
+            padding: 0;
+        }
+
+        input[type="color"]::-webkit-color-swatch {
+            border: none;
+            border-radius: 8px;
+            box-shadow: 0 0 0 1px var(--border);
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--primary);
+        }
+
+        button {
+            background-color: var(--primary);
+            color: white;
+            font-weight: 600;
+            border: none;
+            cursor: pointer;
+            padding: 1rem;
+            transition: all 0.2s ease;
+        }
+
+        button:hover {
+            background-color: var(--secondary);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(67, 97, 238, 0.2);
+        }
+
+        .coffee-section {
+            text-align: center;
+            margin-top: 1rem;
+            padding: 1.5rem;
+            background-color: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.05);
+        }
+
+        .coffee-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.8rem 1.5rem;
+            background: linear-gradient(45deg, #ffdd00, #ffca00);
+            color: #333;
+            font-weight: 700;
+            text-decoration: none;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 12px rgba(255, 202, 0, 0.2);
+        }
+
+        .coffee-button:hover {
+            transform: translateY(-3px) scale(1.03);
+            box-shadow: 0 6px 18px rgba(255, 202, 0, 0.25);
+        }
+
+        .coffee-icon {
+            font-size: 1.2rem;
+        }
+
+        #color-warning {
+            display: none;
+            color: var(--warning);
+            margin-top: 0.5rem;
+            font-size: 0.875rem;
+            font-weight: 500;
+            padding: 0.5rem;
+            background-color: rgba(255, 84, 0, 0.1);
+            border-radius: 6px;
+        }
+
+        /* Modal styles */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            overflow: auto;
+        }
+
+        .modal-content {
+            background-color: var(--card-bg);
+            margin: 15% auto;
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            max-width: 500px;
+            width: 90%;
+            text-align: center;
+            animation: modalAppear 0.3s ease-out;
+        }
+
+        @keyframes modalAppear {
+            from {opacity: 0; transform: translateY(-30px);}
+            to {opacity: 1; transform: translateY(0);}
+        }
+
+        .modal-title {
+            color: var(--warning);
+            margin-top: 0;
+        }
+
+        .modal-buttons {
+            display: flex;
+            justify-content: center;
+            gap: 1rem;
+            margin-top: 1.5rem;
+        }
+
+        .modal-buttons button {
+            max-width: 150px;
+        }
+
+        .btn-secondary {
+            background-color: #6c757d;
+        }
+
+        .btn-secondary:hover {
+            background-color: #5a6268;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 0 1rem;
+                margin: 1rem auto;
+            }
+
+            .card {
+                padding: 1.5rem;
+            }
+
+            .color-row {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .checkbox-group {
+                margin-top: 0.5rem;
+            }
+        }
+
+        .footer {
+            margin-top: 2rem;
+            text-align: center;
+            font-size: 0.875rem;
+            color: #6c757d;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h1>QR Code Generator</h1>
+            <form id="qr-form" action="/generate" method="post" enctype="multipart/form-data">
+                <div class="form-group">
+                    <label for="data-input">Text or URL</label>
+                    <input type="text" id="data-input" name="data" placeholder="Enter text or URL for your QR code" required>
+                </div>
+
+                <div class="form-group">
+                    <label>Background Image/GIF (Optional)</label>
+                    <div class="file-upload" id="file-upload-area">
+                        <p>Drag & drop your image here or click to browse</p>
+                        <span class="file-name" id="file-name">No file chosen</span>
+                        <input type="file" name="file" id="file-input" accept="image/*">
+                    </div>
+                </div>
+
+                <div class="form-group color-section">
+                    <label for="color-picker">QR Code Options</label>
+                    <div class="color-row">
+                        <div class="color-picker-container">
+                            <input type="color" id="color-picker" name="color" value="#000000">
+                        </div>
+                        <div id="color-warning" style="display: none; color: red; font-weight: bold;">Please select a darker color for better QR code visibility!</div>
+                        <div class="checkbox-group">
+                            <input type="checkbox" name="contrast_qr" id="contrast_qr">
+                            <label for="contrast_qr">Automatically Pick QR Color</label>
+                        </div>
+                    </div>
+                    <div id="color-warning">
+                        Please select a dark color for better QR code visibility!
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="filename-input">Filename (Optional)</label>
+                    <input type="text" id="filename-input" name="filename" placeholder="Enter filename for your QR code">
+                </div>
+
+                <button type="submit">Generate QR Code</button>
+            </form>
+        </div>
+
+        <div class="coffee-section">
+            <p>If this tool is helpful, please consider supporting me</p>
+            <a href="https://buymeacoffee.com/talltreee" target="_blank" class="coffee-button">
+                <span class="coffee-icon">☕</span>
+                Buy Me a Coffee
+            </a>
+        </div>
+
+        <div class="footer">
+            <p>Made with ❤️ by talltreee</p>
+        </div>
+    </div>
+
+    <!-- Add modal for unscannable QR code notification -->
+    <div id="unscannable-modal" class="modal">
+        <div class="modal-content">
+            <h2 class="modal-title">⚠️ QR Code May Not Be Scannable</h2>
+            <p>The QR code generated with this background may be difficult to scan. This can happen due to:</p>
+            <ul style="text-align: left;">
+                <li>Background image is too busy or has too much contrast</li>
+                <li>QR code color doesn't stand out enough from the background</li>
+                <li>Background image has patterns that interfere with QR code scanning</li>
+            </ul>
+            <p>Would you like to try with a different background image or adjust the QR color?</p>
+            <div class="modal-buttons">
+                <button id="try-again-btn" class="btn-secondary">Try Again</button>
+                <button id="download-anyway-btn">Download Anyway</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            const colorPicker = document.getElementById('color-picker');
+            const colorPreview = document.getElementById('color-preview');
+            const colorHex = document.getElementById('color-hex');
+            const colorWarning = document.getElementById('color-warning');
+            const qrForm = document.getElementById('qr-form');
+            const fileInput = document.getElementById('file-input');
+            const fileUploadArea = document.getElementById('file-upload-area');
+            const fileName = document.getElementById('file-name');
+            const unscannableModal = document.getElementById('unscannable-modal');
+            const tryAgainBtn = document.getElementById('try-again-btn');
+            const downloadAnywayBtn = document.getElementById('download-anyway-btn');
+            
+            // Flag to track if we're downloading anyway
+            let downloadAnyway = false;
+            let qrBlob = null;
+            let qrFilename = null;
+
+            function isLightColor(color) {
+                // Convert hex to RGB
+                const r = parseInt(color.substr(1, 2), 16);
+                const g = parseInt(color.substr(3, 2), 16);
+                const b = parseInt(color.substr(5, 2), 16);
+
+                // Calculate luminance
+                const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+
+                // Consider color light if luminance is above 0.5
+                return luminance > 0.5;
+            }
+
+            colorPicker.addEventListener('input', function() {
+                if (isLightColor(colorPicker.value)) {
+                    colorWarning.style.display = 'block';
+                    alert("Warning: The selected color is too light. Please choose a darker color for the QR code to be scannable.");
+                } else {
+                    colorWarning.style.display = 'none';
+                }
+            });
+
+            qrForm.addEventListener('submit', function(event) {
+                if (isLightColor(colorPicker.value)) {
+                    event.preventDefault();
+                    colorWarning.style.display = 'block';
+                    window.scrollTo({
+                        top: colorWarning.offsetTop - 100,
+                        behavior: 'smooth'
+                    });
+                    return;
+                }
+                
+                // If not downloading anyway, intercept the form submission
+                if (!downloadAnyway) {
+                    event.preventDefault();
+                    
+                    const formData = new FormData(qrForm);
+                    
+                    // Add a parameter to check scannability
+                    formData.append('check_scannable', 'true');
+                    
+                    fetch('/generate', {
+                        method: 'POST',
+                        body: formData
+                    })
+                    .then(response => {
+                        if (response.headers.get('Content-Type').includes('application/json')) {
+                            return response.json().then(data => {
+                                if (data.scannable === false) {
+                                    // Show the modal if not scannable
+                                    unscannableModal.style.display = 'block';
+                                    // Save the blob data for potential download
+                                    return response.blob().then(blob => {
+                                        qrBlob = blob;
+                                        qrFilename = data.filename;
+                                        return data;
+                                    });
+                                } else {
+                                    // If scannable, get the blob and trigger download
+                                    return response.blob().then(blob => {
+                                        downloadQrCode(blob, data.filename);
+                                        return data;
+                                    });
+                                }
+                            });
+                        } else {
+                            // If response is not JSON, it's the direct file
+                            return response.blob().then(blob => {
+                                downloadQrCode(blob, formData.get('filename') || 'qr_code');
+                                return { scannable: true };
+                            });
+                        }
+                    })
+                    .catch(error => {
+                        console.error('Error:', error);
+                        alert('An error occurred. Please try again.');
+                    });
+                }
+                
+                // Reset the flag after submission
+                downloadAnyway = false;
+            });
+
+            // Download the QR code blob
+            function downloadQrCode(blob, filename) {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }
+
+            // Try again button
+            tryAgainBtn.addEventListener('click', function() {
+                unscannableModal.style.display = 'none';
+            });
+
+            // Download anyway button
+            downloadAnywayBtn.addEventListener('click', function() {
+                unscannableModal.style.display = 'none';
+                if (qrBlob) {
+                    downloadQrCode(qrBlob, qrFilename);
+                    qrBlob = null;
+                } else {
+                    // If we don't have the blob yet, resubmit the form with the flag
+                    downloadAnyway = true;
+                    qrForm.submit();
+                }
+            });
+
+            // File upload handling
+            fileUploadArea.addEventListener('click', function() {
+                fileInput.click();
+            });
+
+            fileInput.addEventListener('change', function() {
+                if (fileInput.files.length > 0) {
+                    fileName.textContent = fileInput.files[0].name;
+                    fileName.style.display = 'block';
+                    fileUploadArea.style.borderColor = 'var(--success)';
+                } else {
+                    fileName.textContent = 'No file chosen';
+                    fileName.style.display = 'none';
+                    fileUploadArea.style.borderColor = 'var(--border)';
+                }
+            });
+
+            // Drag and drop handling
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+                fileUploadArea.addEventListener(eventName, preventDefaults, false);
+            });
+
+            function preventDefaults(e) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+
+            ['dragenter', 'dragover'].forEach(eventName => {
+                fileUploadArea.addEventListener(eventName, highlight, false);
+            });
+
+            ['dragleave', 'drop'].forEach(eventName => {
+                fileUploadArea.addEventListener(eventName, unhighlight, false);
+            });
+
+            function highlight() {
+                fileUploadArea.style.borderColor = 'var(--accent)';
+                fileUploadArea.style.backgroundColor = 'rgba(67, 97, 238, 0.1)';
+            }
+
+            function unhighlight() {
+                fileUploadArea.style.borderColor = 'var(--border)';
+                fileUploadArea.style.backgroundColor = 'rgba(67, 97, 238, 0.03)';
+            }
+
+            fileUploadArea.addEventListener('drop', handleDrop, false);
+
+            function handleDrop(e) {
+                const dt = e.dataTransfer;
+                const files = dt.files;
+
+                if (files.length > 0) {
+                    fileInput.files = files;
+                    fileName.textContent = files[0].name;
+                    fileName.style.display = 'block';
+                    fileUploadArea.style.borderColor = 'var(--success)';
+                }
+            }
+        });
+    </script>
+</body>
+</html>
+'''
+
+def is_qr_code_scannable(image_path):
+    try:
+        image = cv2.imread(image_path)
+        qr_code_detector = cv2.QRCodeDetector()
+        data, _, _ = qr_code_detector.detectAndDecode(image)
+        return bool(data)
+    except Exception as e:
+        print(f"Error checking QR code scannability: {e}")
+        return False
+
+def get_opposite_dark_color(image_path):
+    """Returns a high-contrast dark color based on the majority color of the image."""
+    image = Image.open(image_path)
+    if image.format == "GIF":
+        frames = [frame.convert("RGB") for frame in ImageSequence.Iterator(image)]
+        all_pixels = np.concatenate([np.array(frame).reshape(-1, 3) for frame in frames], axis=0)
+    else:
+        image = image.convert("RGB")
+        all_pixels = np.array(image).reshape(-1, 3)
+
+    avg_color = np.mean(all_pixels, axis=0)
+    opposite_color = 255 - avg_color
+    dark_color = tuple(max(0, min(100, int(c))) for c in opposite_color)
+    return f'#{dark_color[0]:02x}{dark_color[1]:02x}{dark_color[2]:02x}'
+
+def is_image_dark(image_path):
+    try:
+        image = Image.open(image_path)
+
+        if image.format == "GIF":
+            frames = [frame.convert("L") for frame in ImageSequence.Iterator(image)]
+            avg_luminance = sum(ImageStat.Stat(frame).mean[0] for frame in frames) / len(frames)
+        else:
+            image = image.convert("L")
+            avg_luminance = ImageStat.Stat(image).mean[0]
+
+        return avg_luminance < 128
+    except Exception as e:
+        print(f"Error analyzing image brightness: {e}")
+        return False
+
+def is_image_high_contrast(image_path):
+    try:
+        image = Image.open(image_path)
+        if image.format == "GIF":
+            frames = [frame.convert("L") for frame in ImageSequence.Iterator(image)]
+            all_pixels = np.concatenate([np.array(frame).flatten() for frame in frames])
+        else:
+            image = image.convert("L")
+            all_pixels = np.array(image).flatten()
+
+        dark_threshold = np.percentile(all_pixels, 5)
+        bright_threshold = np.percentile(all_pixels, 95)
+
+        contrast = bright_threshold - dark_threshold
+        return contrast > 100
+    except Exception as e:
+        print(f"Error analyzing image contrast: {e}")
+        return False
+
+def invert_image(image_path):
+    try:
+        image = Image.open(image_path)
+        inverted_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
+
+        if image.format == "GIF":
+            frames = [ImageOps.invert(frame.convert("RGB")) for frame in ImageSequence.Iterator(image)]
+            frames[0].save(inverted_path, save_all=True, append_images=frames[1:])
+        else:
+            image = ImageOps.invert(image.convert("RGB"))
+            image.save(inverted_path)
+
+        return inverted_path
+    except Exception as e:
+        print(f"Error inverting image: {e}")
+        return image_path
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return HTML_TEMPLATE
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    # Create temporary directories for this session
-    session_upload_folder = tempfile.mkdtemp()
-    session_results_folder = tempfile.mkdtemp()
-    
-    if 'files[]' not in request.files:
-        flash('No file part', 'error')
-        return redirect(request.url)
-    
-    files = request.files.getlist('files[]')
-    
-    if not files or all(file.filename == '' for file in files):
-        flash('No selected file', 'error')
-        return redirect(request.url)
-    
-    # Save files to temp upload folder
-    file_paths = []
-    try:
-        for file in files:
-            if file and allowed_file(file.filename):
-                filename = secure_filename(file.filename)
-                file_path = os.path.join(session_upload_folder, filename)
-                file.save(file_path)
-                file_paths.append(file_path)
-            else:
-                flash(f'Invalid file type: {file.filename}. Only PNG and JPG are allowed.', 'error')
-        
-        if not file_paths:
-            return redirect(request.url)
-        
-        # Process the uploaded business cards
-        results = process_multiple_cards(file_paths)
-        
-        if results:
-            # Generate results files
-            df = pd.DataFrame(results)
-            result_id = str(int(time.time()))
-            
-            csv_path = os.path.join(session_results_folder, f"results_{result_id}.csv")
-            df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-            
-            # Store path in session
-            session['last_result'] = {
-                'csv_path': csv_path,
-                'result_id': result_id
-            }
-            
-            # Clean up upload directory
-            for file_path in file_paths:
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
-            try:
-                os.rmdir(session_upload_folder)
-            except:
-                pass
-            
-            # Trigger immediate download
-            return send_file(
-                csv_path,
-                as_attachment=True,
-                download_name=f"business_cards_{result_id}.csv",
-                mimetype='text/csv'
-            )
-        else:
-            flash('No business card information could be extracted', 'error')
-            return redirect(request.url)
-            
-    except Exception as e:
-        flash(f'Error processing files: {str(e)}', 'error')
-        return redirect(request.url)
-    finally:
-        # Clean up temp directories in case of errors
+@app.route('/generate', methods=['POST'])
+def generate_qr():
+    data = request.form.get('data')
+    file = request.files.get('file')
+    filename = request.form.get('filename') or 'qr_code'
+    color = request.form.get('color', '#000000')
+    bw = request.form.get('bw')
+    contrast_qr = request.form.get('contrast_qr')  # Checkbox for high contrast QR color
+    check_scannable = request.form.get('check_scannable', 'false') == 'true'  # New parameter
+
+    if not data:
+        return "No data provided", 400
+
+    filename = secure_filename(filename)
+    file_extension = 'png'
+    qr = segno.make(data, error='H', boost_error=True)
+    temp_file_path = None
+
+    if file:
+        uploaded_filename = secure_filename(file.filename)
+        allowed_extensions = {'.png', '.jpg', '.jpeg', '.gif'}
+        file_ext = os.path.splitext(uploaded_filename)[1].lower()
+        if file_ext not in allowed_extensions:
+            return "Invalid file format. Please upload a PNG, JPG, or GIF image.", 400
+
+        temp_file = tempfile.NamedTemporaryFile(delete=False, dir=app.config['UPLOAD_FOLDER'], suffix=file_ext)
+        file.save(temp_file.name)
+        temp_file_path = temp_file.name
+
+        if is_image_dark(temp_file_path) and not is_image_high_contrast(temp_file_path):
+            temp_file_path = invert_image(temp_file_path)
+
+        file_extension = file_ext[1:].lower()
+
+    if contrast_qr and temp_file_path:  # If the checkbox is checked, apply opposite color
+        color = get_opposite_dark_color(temp_file_path)
+
+    img_io = BytesIO()
+    is_scannable = True
+
+    if temp_file_path:
         try:
-            import shutil
-            shutil.rmtree(session_upload_folder, ignore_errors=True)
-            shutil.rmtree(session_results_folder, ignore_errors=True)
-        except:
-            pass
+            output_qr_path = tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_extension}").name
+            qr.to_artistic(background=temp_file_path, target=output_qr_path, scale=12, border=4, kind='jpeg' if file_extension == 'jpg' else file_extension, dark=color)
 
-@app.route('/download/<filetype>/<result_id>')
-def download_file(filetype, result_id):
-    from flask import session
-    
-    if 'last_result' not in session or session['last_result']['result_id'] != result_id:
-        flash('Result not found or expired', 'error')
-        return redirect(url_for('index'))
-    
-    if filetype == 'csv':
-        file_path = session['last_result']['csv_path']
-        return send_file(file_path, as_attachment=True, download_name=f"business_cards_{result_id}.csv")
-    elif filetype == 'excel':
-        file_path = session['last_result']['excel_path']
-        return send_file(file_path, as_attachment=True, download_name=f"business_cards_{result_id}.xlsx")
+            # Check if the QR code is scannable
+            if check_scannable:
+                is_scannable = is_qr_code_scannable(output_qr_path)
+
+            with open(output_qr_path, "rb") as qr_file:
+                img_io.write(qr_file.read())
+
+            img_io.seek(0)
+        except Exception as e:
+            return f"Error generating QR code with background: {e}", 400
+        finally:
+            if temp_file_path:
+                os.unlink(temp_file_path)
+            if 'output_qr_path' in locals() and os.path.exists(output_qr_path):
+                os.unlink(output_qr_path)
     else:
-        flash('Invalid file type requested', 'error')
-        return redirect(url_for('index'))
+        qr.save(img_io, kind='png', scale=12, border=4, dark=color)
+        img_io.seek(0)
+        # Plain QR codes should always be scannable
+        is_scannable = True
+
+    # If checking scannability and the QR is not scannable, return JSON response
+    if check_scannable and not is_scannable:
+        from flask import jsonify
+        return jsonify({
+            'scannable': False,
+            'filename': f"{filename}.{file_extension}",
+            'message': "The generated QR code may not be scannable. Please try a different background or color."
+        })
+
+    return send_file(img_io, mimetype=f'image/{file_extension}', as_attachment=True, download_name=f"{filename}.{file_extension}")
 
 if __name__ == '__main__':
     app.run(debug=True)
