@@ -1,10 +1,4 @@
 Flask==3.0.3
-segno[all]==1.6.1
-Pillow==10.2.0
-Werkzeug==3.0.2
-requests==2.31.0
-numpy==1.26.4
-opencv-python-headless==4.9.0.80
-pypng==0.20220715.0
-qrcode-artistic==3.0.2
-pyzbar==0.1.9
+google-cloud-vision==2.11.1
+pandas==2.1.1
+opencv-python==4.5.3.56
